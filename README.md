@@ -34,6 +34,13 @@ retry.
   this window could theoretically let a concurrent retry through: real
   systems should set this based on their slowest realistic handler
   duration, not leave it as a guess.
+- **Wait-and-poll for genuine concurrency**: a sequential retry (client
+  waits for a response before retrying) hits `begin()` and gets the
+  replayed result cleanly. A *genuinely concurrent* duplicate - e.g. a
+  double-clicked submit button firing two requests almost simultaneously -
+  instead polls via `wait_for_completion()` for the in-flight request to
+  finish, then replays its result, rather than immediately returning 409.
+  Falls back to 409 with `Retry-After` only if the wait times out.
 
 ## Usage
 
@@ -48,8 +55,8 @@ except IdempotencyConflict:
     # same key, different body - client error
     ...
 except IdempotencyInProgress:
-    # duplicate concurrent request - ask the client to retry later
-    ...
+    # a concurrent duplicate is already running - wait for it instead of failing
+    existing = guard.wait_for_completion(idempotency_key, request_body, timeout_seconds=5.0)
 
 if existing is not None:
     return existing.body  # replay, don't re-run the operation
@@ -87,8 +94,6 @@ curl -X POST localhost:8000/payments \
 
 ## Possible extensions
 
-- Wait-and-poll behavior for `IN_PROGRESS` conflicts instead of an
-  immediate 409, for clients that would rather block briefly than retry
 - Per-route TTL configuration (a fast lookup endpoint and a slow batch
   endpoint shouldn't share the same lock timeout)
 - Idempotency key expiry sweep metrics - how often keys are reused past

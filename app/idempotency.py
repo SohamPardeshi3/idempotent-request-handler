@@ -18,6 +18,7 @@ in main.py is a thin integration on top of this.
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -34,6 +35,10 @@ class IdempotencyConflict(Exception):
 
 class IdempotencyInProgress(Exception):
     """Raised when a request with this exact key and body is already being processed."""
+
+
+class IdempotencyStillInProgress(Exception):
+    """Raised when wait_for_completion() times out before the original request finished."""
 
 
 @dataclass
@@ -114,6 +119,55 @@ class IdempotencyGuard:
             )
 
         return StoredResponse(status_code=existing["status_code"], body=existing["body"])
+
+    def wait_for_completion(
+        self,
+        idempotency_key: str,
+        request_body: dict,
+        timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.1,
+    ) -> Optional[StoredResponse]:
+        """
+        Polls until the in-progress request behind this key finishes, instead
+        of failing the caller immediately. Useful for genuinely concurrent
+        duplicate requests (e.g. a double-clicked submit button) where the
+        second request would rather wait a moment for the real result than
+        get an immediate 409.
+
+        Returns the StoredResponse once the original request completes.
+        Returns None if the lock disappears mid-wait without ever
+        completing (e.g. the original request's process crashed and its
+        lock TTL expired) - the caller should treat this as "no one holds
+        this key anymore" and attempt begin() again.
+        Raises IdempotencyConflict if the stored hash doesn't match this
+        call's body.
+        Raises IdempotencyStillInProgress if the timeout elapses first.
+        """
+        request_hash = self._hash_body(request_body)
+        key = self._key(idempotency_key)
+        deadline = time.monotonic() + timeout_seconds
+
+        while time.monotonic() < deadline:
+            raw = self.redis.get(key)
+
+            if raw is None:
+                return None
+
+            existing = json.loads(raw)
+
+            if existing["hash"] != request_hash:
+                raise IdempotencyConflict(
+                    f"Idempotency key '{idempotency_key}' was already used with a different request body"
+                )
+
+            if existing["state"] == IdempotencyState.COMPLETED.value:
+                return StoredResponse(status_code=existing["status_code"], body=existing["body"])
+
+            time.sleep(poll_interval_seconds)
+
+        raise IdempotencyStillInProgress(
+            f"Timed out after {timeout_seconds}s waiting for idempotency key '{idempotency_key}' to complete"
+        )
 
     def complete(self, idempotency_key: str, request_body: dict, status_code: int, response_body: dict) -> None:
         """Stores the final response so future retries with this key replay it instead of re-executing."""

@@ -1,3 +1,6 @@
+import threading
+import time
+
 import fakeredis
 import pytest
 from fastapi.testclient import TestClient
@@ -56,3 +59,37 @@ def test_reusing_key_with_different_body_returns_409(client):
 def test_missing_idempotency_key_header_is_rejected(client):
     res = client.post("/payments", json={"amount": 100})
     assert res.status_code == 422  # FastAPI's required-header validation error
+
+
+def test_genuinely_concurrent_duplicate_requests_wait_and_get_same_result(client):
+    """
+    Fires two requests with the same key + body from separate threads,
+    the second one starting shortly after the first (while it's still
+    inside its simulated 0.3s processing delay). The second request
+    should hit the IN_PROGRESS state, wait via wait_for_completion, and
+    come back with the exact same payment_id as the first - proving it
+    replayed the result rather than running the payment logic twice.
+    """
+    headers = {"Idempotency-Key": "concurrent-order-1"}
+    body = {"amount": 750, "currency": "USD"}
+
+    results = {}
+
+    def fire(label, delay_before):
+        time.sleep(delay_before)
+        results[label] = client.post("/payments", json=body, headers=headers)
+
+    t1 = threading.Thread(target=fire, args=("first", 0))
+    t2 = threading.Thread(target=fire, args=("second", 0.05))  # starts while "first" is still sleeping
+
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert results["first"].status_code == 200
+    assert results["second"].status_code == 200
+    assert results["first"].json()["payment_id"] == results["second"].json()["payment_id"], (
+        "the second concurrent request should have waited and replayed the first result, "
+        "not executed the payment logic a second time"
+    )
